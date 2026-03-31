@@ -29,7 +29,7 @@ class PipelineConfig:
 
     train_data_path: Path = Path("dataset/test_train_scaled/weather_train_2009_2020_scaled.csv")
     test_data_path: Path = Path("dataset/test_train_scaled/weather_test_2021_scaled.csv")
-    target_column: str = "max_temp"
+    target_column: str = "rain"
     random_seed: int = 42
     validation_size: float = 0.2
     output_base_dir: Path = Path("output")
@@ -45,6 +45,8 @@ class PipelineConfig:
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,
             "objective": "reg:squarederror",
+            "eval_metric": "rmse",
+            "early_stopping_rounds": 50,
             "n_jobs": -1,
             "random_state": 42,
         }
@@ -70,10 +72,27 @@ def create_output_dir(base_dir: Path) -> Path:
 
 
 def load_data(config: PipelineConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load train and test CSV files."""
+    """Load train and test CSV files, parse date, and sort chronologically."""
     try:
         train_df = pd.read_csv(config.train_data_path)
         test_df = pd.read_csv(config.test_data_path)
+
+        for name, df in [("train", train_df), ("test", test_df)]:
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                invalid_dates = int(df["date"].isna().sum())
+                if invalid_dates > 0:
+                    raise ValueError(f"{name} data has {invalid_dates} invalid 'date' values.")
+
+                sort_cols = ["date"]
+                if "province_encoded" in df.columns:
+                    sort_cols = ["province_encoded", "date"]
+                elif "region_encoded" in df.columns:
+                    sort_cols = ["region_encoded", "date"]
+
+                df.sort_values(sort_cols, inplace=True)
+                df.reset_index(drop=True, inplace=True)
+
         LOGGER.info("Loaded train shape: %s", train_df.shape)
         LOGGER.info("Loaded test shape: %s", test_df.shape)
         return train_df, test_df
@@ -115,7 +134,13 @@ def preprocess_data(
     test_df: pd.DataFrame,
     config: PipelineConfig,
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, PreprocessArtifacts]:
-    """Validate and preprocess train/test data into model-ready matrices."""
+    """
+    Validate and preprocess train/test data into model-ready matrices.
+
+    Important:
+    - This version does NOT impute missing values yet.
+    - Imputation will be done AFTER train/validation split to avoid leakage.
+    """
     try:
         if config.target_column not in train_df.columns or config.target_column not in test_df.columns:
             raise ValueError(f"Target column '{config.target_column}' not found in both train/test.")
@@ -140,19 +165,11 @@ def preprocess_data(
         x_train_full = x_train_full.replace([np.inf, -np.inf], np.nan)
         x_test = x_test.replace([np.inf, -np.inf], np.nan)
 
-        numeric_fill_values = x_train_full.median(numeric_only=True).to_dict()
-
-        x_train_full = x_train_full.fillna(value=numeric_fill_values).fillna(0.0)
-        x_test = x_test.fillna(value=numeric_fill_values).fillna(0.0)
-
-        y_train_full = y_train_full.fillna(y_train_full.median())
-        y_test = y_test.fillna(y_train_full.median())
-
         artifacts = PreprocessArtifacts(
             target_column=config.target_column,
             datetime_columns=datetime_columns,
             feature_columns=list(x_train_full.columns),
-            numeric_fill_values={k: float(v) for k, v in numeric_fill_values.items()},
+            numeric_fill_values={},
         )
 
         LOGGER.info(
@@ -207,13 +224,13 @@ def train_model(
     x_val: pd.DataFrame,
     y_val: pd.Series,
 ) -> XGBRegressor:
-    """Fit model and evaluate on validation set during training."""
+    """Fit model and monitor validation set during training."""
     try:
         LOGGER.info("Training started. Train rows: %d, Validation rows: %d", len(x_train), len(x_val))
         model.fit(
             x_train,
             y_train,
-            eval_set=[(x_train, y_train), (x_val, y_val)],
+            eval_set=[(x_val, y_val)],
             verbose=False,
         )
         LOGGER.info("Training finished.")
@@ -361,6 +378,21 @@ def run_training_pipeline(config: PipelineConfig) -> Dict[str, Any]:
     x_train_full, y_train_full, x_test, y_test, artifacts = preprocess_data(train_df, test_df, config)
     x_train, x_val, y_train, y_val = split_data(x_train_full, y_train_full, config)
 
+    # Fit imputation only on training split to avoid leakage
+    numeric_fill_values = x_train.median(numeric_only=True).to_dict()
+
+    x_train = x_train.fillna(value=numeric_fill_values).fillna(0.0)
+    x_val = x_val.fillna(value=numeric_fill_values).fillna(0.0)
+    x_test = x_test.fillna(value=numeric_fill_values).fillna(0.0)
+
+    train_target_fill = float(y_train.median()) if y_train.notna().any() else 0.0
+    y_train = y_train.fillna(train_target_fill)
+    y_val = y_val.fillna(train_target_fill)
+    y_test = y_test.fillna(train_target_fill)
+
+    artifacts.numeric_fill_values = {k: float(v) for k, v in numeric_fill_values.items()}
+    artifacts.feature_columns = list(x_train.columns)
+
     model = build_model(config)
     model = train_model(model, x_train, y_train, x_val, y_val)
 
@@ -503,7 +535,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--train-path", type=str, default="dataset/test_train_scaled/weather_train_2009_2020_scaled.csv")
     parser.add_argument("--test-path", type=str, default="dataset/test_train_scaled/weather_test_2021_scaled.csv")
-    parser.add_argument("--target", type=str, default="max_temp")
+    parser.add_argument("--target", type=str, default="rain")
     parser.add_argument("--output-dir", type=str, default="output")
 
     parser.add_argument("--new-data-path", type=str, default=None)

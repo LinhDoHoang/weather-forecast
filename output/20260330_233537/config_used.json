@@ -1,0 +1,22 @@
+{
+  "train_data_path": "dataset\\test_train_scaled\\weather_train_2009_2020_scaled.csv",
+  "test_data_path": "dataset\\test_train_scaled\\weather_test_2021_scaled.csv",
+  "target_column": "rain",
+  "random_seed": 42,
+  "validation_size": 0.2,
+  "output_base_dir": "output",
+  "model_filename": "xgb_weather_model.joblib",
+  "artifacts_filename": "preprocessing_artifacts.joblib",
+  "model_params": {
+    "n_estimators": 600,
+    "learning_rate": 0.05,
+    "max_depth": 8,
+    "subsample": 0.9,
+    "colsample_bytree": 0.9,
+    "reg_alpha": 0.0,
+    "reg_lambda": 1.0,
+    "objective": "reg:squarederror",
+    "n_jobs": -1,
+    "random_state": 42
+  }
+}
