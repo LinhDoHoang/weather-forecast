@@ -28,12 +28,18 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import RobustScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from xgboost import XGBRegressor
+
+try:
+    from prophet import Prophet
+except ImportError:
+    Prophet = None
 
 warnings.filterwarnings("ignore")
 
@@ -50,6 +56,9 @@ class PipelineConfig:
     output_dir: Path = field(default_factory=lambda: Path("dataset/v3"))
 
     # Preprocessing
+    train_end_year: int = 2018
+    val_start_year: int = 2019
+    val_end_year: int = 2020
     test_year: int = 2021
     random_seed: int = 42
     lag_windows: Tuple[int, ...] = (7, 14, 30)
@@ -84,10 +93,23 @@ class PipelineConfig:
     xgb_min_child_weight: int = 5
     xgb_cv_folds: int = 5
 
+    # Random Forest hyperparameters
+    rf_n_estimators: int = 500
+    rf_max_depth: Optional[int] = None
+    rf_min_samples_leaf: int = 2
+    rf_max_features: str = "sqrt"
+    rf_cv_folds: int = 3
+
+    # Prophet hyperparameters
+    prophet_yearly_seasonality: bool = True
+    prophet_weekly_seasonality: bool = True
+    prophet_changepoint_prior_scale: float = 0.05
+    prophet_seasonality_mode: str = "additive"
+
     # LSTM hyperparameters
     lstm_lookback: int = 30
     lstm_batch_size: int = 512
-    lstm_epochs: int = 50
+    lstm_epochs: int = 5
     lstm_lr: float = 5e-4
     lstm_hidden1: int = 128
     lstm_hidden2: int = 64
@@ -383,30 +405,44 @@ def engineer_features(df: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 3: TEMPORAL TRAIN / TEST SPLIT
+# STEP 3: TEMPORAL TRAIN / VALIDATION / TEST SPLIT
 # ═════════════════════════════════════════════════════════════════════════════
-def split_train_test(df: pd.DataFrame, cfg: PipelineConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    log.step("PHÂN CHIA TRAIN / TEST (temporal)")
+def split_train_val_test(
+    df: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    log.step("PHÂN CHIA TRAIN / VALIDATION / TEST (temporal)")
 
-    split_date = pd.Timestamp(f"{cfg.test_year}-01-01")
-    train_df = df[df["date"] < split_date].copy()
-    test_df = df[df["date"] >= split_date].copy()
+    train_end = pd.Timestamp(f"{cfg.train_end_year}-12-31")
+    val_start = pd.Timestamp(f"{cfg.val_start_year}-01-01")
+    val_end = pd.Timestamp(f"{cfg.val_end_year}-12-31")
+    test_start = pd.Timestamp(f"{cfg.test_year}-01-01")
+
+    train_df = df[df["date"] <= train_end].copy()
+    val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)].copy()
+    test_df = df[df["date"] >= test_start].copy()
+
+    if train_df.empty or val_df.empty or test_df.empty:
+        log.error("Một trong các tập train/validation/test bị rỗng. Kiểm tra lại mốc năm.")
+        sys.exit(1)
 
     log.stat("Train shape", train_df.shape)
+    log.stat("Validation shape", val_df.shape)
     log.stat("Test shape", test_df.shape)
-    log.stat("Train date range",
-             f"{train_df['date'].min().date()} → {train_df['date'].max().date()}")
-    log.stat("Test date range",
-             f"{test_df['date'].min().date()} → {test_df['date'].max().date()}")
-    log.stat("Train rain_log1p mean", f"{train_df[TARGET_COL].mean():.4f}")
-    log.stat("Test rain_log1p mean", f"{test_df[TARGET_COL].mean():.4f}")
+    log.stat("Train date range", f"{train_df['date'].min().date()} → {train_df['date'].max().date()}")
+    log.stat("Validation date range", f"{val_df['date'].min().date()} → {val_df['date'].max().date()}")
+    log.stat("Test date range", f"{test_df['date'].min().date()} → {test_df['date'].max().date()}")
 
-    if train_df["date"].max() >= test_df["date"].min():
-        log.error("DATA LEAKAGE detected!")
+    if not (train_df["date"].max() < val_df["date"].min() and val_df["date"].max() < test_df["date"].min()):
+        log.error("DATA LEAKAGE detected between train/validation/test!")
         sys.exit(1)
+
+    log.stat("Train rain_log1p mean", f"{train_df[TARGET_COL].mean():.4f}")
+    log.stat("Validation rain_log1p mean", f"{val_df[TARGET_COL].mean():.4f}")
+    log.stat("Test rain_log1p mean", f"{test_df[TARGET_COL].mean():.4f}")
     log.info("✓ No data leakage")
 
-    return train_df, test_df
+    return train_df, val_df, test_df
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -414,23 +450,28 @@ def split_train_test(df: pd.DataFrame, cfg: PipelineConfig) -> Tuple[pd.DataFram
 # ═════════════════════════════════════════════════════════════════════════════
 def select_scale_save(
     train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     test_df: pd.DataFrame,
     cfg: PipelineConfig,
-) -> Tuple[pd.DataFrame, pd.DataFrame, RobustScaler, RobustScaler]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, RobustScaler, RobustScaler]:
     log.step("CHỌN FEATURES, SCALE & LƯU FILE")
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     keep_cols = ["date"] + FEATURE_COLS + [TARGET_COL, TARGET_ORIG_COL]
     train_out = train_df[keep_cols].copy()
+    val_out = val_df[keep_cols].copy()
     test_out = test_df[keep_cols].copy()
 
     # Save unscaled (for XGBoost — tree-based models don't need scaling)
-    train_unscaled_path = cfg.output_dir / "weather_train_2009_2020.csv"
+    train_unscaled_path = cfg.output_dir / "weather_train_2009_2018.csv"
+    val_unscaled_path = cfg.output_dir / "weather_val_2019_2020.csv"
     test_unscaled_path = cfg.output_dir / "weather_test_2021.csv"
     train_out.to_csv(train_unscaled_path, index=False)
+    val_out.to_csv(val_unscaled_path, index=False)
     test_out.to_csv(test_unscaled_path, index=False)
     log.info(f"Saved unscaled → {train_unscaled_path}")
+    log.info(f"Saved unscaled → {val_unscaled_path}")
     log.info(f"Saved unscaled → {test_unscaled_path}")
 
     # Scale for LSTM — RobustScaler (fit on train only)
@@ -443,17 +484,23 @@ def select_scale_save(
     tgt_scaler.fit(train_out[[TARGET_COL]])
 
     train_scaled = train_out.copy()
+    val_scaled = val_out.copy()
     test_scaled = test_out.copy()
     train_scaled[scale_cols] = feat_scaler.transform(train_out[scale_cols])
+    val_scaled[scale_cols] = feat_scaler.transform(val_out[scale_cols])
     test_scaled[scale_cols] = feat_scaler.transform(test_out[scale_cols])
     train_scaled[TARGET_COL] = tgt_scaler.transform(train_out[[TARGET_COL]])
+    val_scaled[TARGET_COL] = tgt_scaler.transform(val_out[[TARGET_COL]])
     test_scaled[TARGET_COL] = tgt_scaler.transform(test_out[[TARGET_COL]])
 
-    train_scaled_path = cfg.output_dir / "weather_train_2009_2020_scaled.csv"
+    train_scaled_path = cfg.output_dir / "weather_train_2009_2018_scaled.csv"
+    val_scaled_path = cfg.output_dir / "weather_val_2019_2020_scaled.csv"
     test_scaled_path = cfg.output_dir / "weather_test_2021_scaled.csv"
     train_scaled.to_csv(train_scaled_path, index=False)
+    val_scaled.to_csv(val_scaled_path, index=False)
     test_scaled.to_csv(test_scaled_path, index=False)
     log.info(f"Saved scaled   → {train_scaled_path}")
+    log.info(f"Saved scaled   → {val_scaled_path}")
     log.info(f"Saved scaled   → {test_scaled_path}")
 
     # Save scalers
@@ -465,7 +512,7 @@ def select_scale_save(
     log.stat("Scaled feature count", len(scale_cols))
     log.stat("Unscaled (categorical)", list(NO_SCALE_COLS))
 
-    return train_out, test_out, feat_scaler, tgt_scaler
+    return train_out, val_out, test_out, feat_scaler, tgt_scaler
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -562,12 +609,180 @@ def evaluate_xgboost(
         "cv_rmse": f"{cv_rmse.mean():.4f} ± {cv_rmse.std():.4f}",
         "train_time": train_time,
         "predictions_mm": pred_mm,
+        "predictions_log": pred_log,
         "feature_importance": importance,
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 6: EVALUATE — LSTM (PyTorch)
+# STEP 6: EVALUATE — RANDOM FOREST
+# ═════════════════════════════════════════════════════════════════════════════
+def evaluate_random_forest(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    log.step("ĐÁNH GIÁ RANDOM FOREST")
+
+    X_train = train_df[FEATURE_COLS]
+    y_train = train_df[TARGET_COL]
+    X_test = test_df[FEATURE_COLS]
+    y_test_log = test_df[TARGET_COL]
+    y_test_mm = test_df[TARGET_ORIG_COL].values
+
+    model = RandomForestRegressor(
+        n_estimators=cfg.rf_n_estimators,
+        max_depth=cfg.rf_max_depth,
+        min_samples_leaf=cfg.rf_min_samples_leaf,
+        max_features=cfg.rf_max_features,
+        random_state=cfg.random_seed,
+        n_jobs=-1,
+    )
+
+    log.info(f"Cross-validation ({cfg.rf_cv_folds}-fold) trên log1p space...")
+    cv_scores = cross_val_score(
+        model, X_train, y_train,
+        cv=cfg.rf_cv_folds,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1,
+    )
+    cv_rmse = -cv_scores
+    log.stat("CV RMSE (log1p)", f"{cv_rmse.mean():.4f} ± {cv_rmse.std():.4f}")
+
+    log.info("Training on full train set...")
+    t0 = time.time()
+    model.fit(X_train, y_train)
+    train_time = time.time() - t0
+    log.stat("Training time", f"{train_time:.2f}s")
+
+    pred_log = model.predict(X_test)
+
+    mae_log = mean_absolute_error(y_test_log, pred_log)
+    mse_log = mean_squared_error(y_test_log, pred_log)
+    rmse_log = np.sqrt(mse_log)
+    r2_log = r2_score(y_test_log, pred_log)
+
+    log.info("Metrics (log1p space):")
+    log.stat("MAE", f"{mae_log:.4f}")
+    log.stat("RMSE", f"{rmse_log:.4f}")
+    log.stat("R²", f"{r2_log:.4f}")
+
+    pred_mm = np.clip(np.expm1(pred_log), 0, None)
+    mae_mm = mean_absolute_error(y_test_mm, pred_mm)
+    mse_mm = mean_squared_error(y_test_mm, pred_mm)
+    rmse_mm = np.sqrt(mse_mm)
+    r2_mm = r2_score(y_test_mm, pred_mm)
+
+    log.info("Metrics (mm — original scale):")
+    log.stat("MAE", f"{mae_mm:.2f} mm")
+    log.stat("RMSE", f"{rmse_mm:.2f} mm")
+    log.stat("R²", f"{r2_mm:.4f}")
+
+    importance = pd.DataFrame({
+        "feature": FEATURE_COLS,
+        "importance": model.feature_importances_,
+    }).sort_values("importance", ascending=False)
+
+    return {
+        "model_name": "RandomForest",
+        "r2_log": r2_log, "rmse_log": rmse_log, "mae_log": mae_log,
+        "r2_mm": r2_mm, "rmse_mm": rmse_mm, "mae_mm": mae_mm,
+        "cv_rmse": f"{cv_rmse.mean():.4f} ± {cv_rmse.std():.4f}",
+        "train_time": train_time,
+        "predictions_mm": pred_mm,
+        "predictions_log": pred_log,
+        "feature_importance": importance,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 7: EVALUATE — PROPHET
+# ═════════════════════════════════════════════════════════════════════════════
+def evaluate_prophet(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    log.step("ĐÁNH GIÁ PROPHET")
+
+    if Prophet is None:
+        raise ImportError(
+            "Prophet chưa được cài đặt. Hãy cài package 'prophet' trong môi trường hiện tại."
+        )
+
+    test_eval = test_df.reset_index(drop=True).copy()
+    pred_log = np.zeros(len(test_eval), dtype=float)
+
+    t0 = time.time()
+    failures = 0
+    for prov in sorted(test_eval["province_encoded"].unique()):
+        tr = train_df[train_df["province_encoded"] == prov][["date", TARGET_COL]].copy()
+        te = test_eval[test_eval["province_encoded"] == prov][["date"]].copy()
+        idx = test_eval.index[test_eval["province_encoded"] == prov]
+
+        prophet_train = tr.rename(columns={"date": "ds", TARGET_COL: "y"})
+        prophet_test = te.rename(columns={"date": "ds"})
+
+        try:
+            m = Prophet(
+                yearly_seasonality=cfg.prophet_yearly_seasonality,
+                weekly_seasonality=cfg.prophet_weekly_seasonality,
+                daily_seasonality=False,
+                changepoint_prior_scale=cfg.prophet_changepoint_prior_scale,
+                seasonality_mode=cfg.prophet_seasonality_mode,
+                uncertainty_samples=0,
+            )
+            m.fit(prophet_train)
+            forecast = m.predict(prophet_test)
+            pred_log[idx] = forecast["yhat"].to_numpy()
+        except Exception as exc:
+            failures += 1
+            fallback = float(prophet_train["y"].iloc[-1])
+            pred_log[idx] = fallback
+            log.warn(f"Prophet fail province={prov}: {exc}. Fallback = last observed log1p.")
+
+    train_time = time.time() - t0
+    log.stat("Training+forecast time", f"{train_time:.2f}s")
+    log.stat("Province failures", failures)
+
+    y_test_log = test_eval[TARGET_COL].values
+    y_test_mm = test_eval[TARGET_ORIG_COL].values
+
+    mae_log = mean_absolute_error(y_test_log, pred_log)
+    mse_log = mean_squared_error(y_test_log, pred_log)
+    rmse_log = np.sqrt(mse_log)
+    r2_log = r2_score(y_test_log, pred_log)
+
+    pred_mm = np.clip(np.expm1(pred_log), 0, None)
+    mae_mm = mean_absolute_error(y_test_mm, pred_mm)
+    mse_mm = mean_squared_error(y_test_mm, pred_mm)
+    rmse_mm = np.sqrt(mse_mm)
+    r2_mm = r2_score(y_test_mm, pred_mm)
+
+    log.info("Metrics (log1p space):")
+    log.stat("MAE", f"{mae_log:.4f}")
+    log.stat("RMSE", f"{rmse_log:.4f}")
+    log.stat("R²", f"{r2_log:.4f}")
+
+    log.info("Metrics (mm — original scale):")
+    log.stat("MAE", f"{mae_mm:.2f} mm")
+    log.stat("RMSE", f"{rmse_mm:.2f} mm")
+    log.stat("R²", f"{r2_mm:.4f}")
+
+    return {
+        "model_name": "Prophet",
+        "r2_log": r2_log, "rmse_log": rmse_log, "mae_log": mae_log,
+        "r2_mm": r2_mm, "rmse_mm": rmse_mm, "mae_mm": mae_mm,
+        "cv_rmse": "N/A",
+        "train_time": train_time,
+        "predictions_mm": pred_mm,
+        "predictions_log": pred_log,
+        "feature_importance": None,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 8: EVALUATE — LSTM (PyTorch)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class _SequenceDataset(Dataset):
@@ -830,8 +1045,6 @@ def _write_markdown_report(
     metrics: Dict[str, Any],
     xgb: Dict[str, Any],
     lstm: Dict[str, Any],
-    region_df: pd.DataFrame,
-    month_df: pd.DataFrame,
     cfg: PipelineConfig,
     pipeline_time: float,
     ts: str,
@@ -845,8 +1058,10 @@ def _write_markdown_report(
         "# Rainfall Prediction — Evaluation Report",
         "",
         f"**Run:** {ts}  ",
-        f"**Train period:** 2009–2020  ",
-        f"**Test period:** {cfg.test_year} (Jan–Jun)  ",
+        f"**Train period:** 2009–{cfg.train_end_year}  ",
+        f"**Validation period:** {cfg.val_start_year}–{cfg.val_end_year}  ",
+        f"**Final fit period (for model training):** 2009–{cfg.val_end_year}  ",
+        f"**Test period:** {cfg.test_year}  ",
         f"**Features:** {metrics['n_features']}  ",
         f"**Pipeline time:** {pipeline_time:.1f}s  ",
         "",
@@ -892,42 +1107,7 @@ def _write_markdown_report(
         "",
         "---",
         "",
-        "## 3. Evaluation by Region",
-        "",
-        "| Region | N | XGB MAE | XGB RMSE | XGB R² | GRU MAE | GRU RMSE | GRU R² |",
-        "|:-------|--:|--------:|---------:|-------:|--------:|---------:|-------:|",
-    ]
-    for _, r in region_df.iterrows():
-        lines.append(
-            f"| {r['region']} | {int(r['n'])} "
-            f"| {_fmt(r['xgb_mae'], 2)} | {_fmt(r['xgb_rmse'], 2)} | {_fmt(r['xgb_r2'])} "
-            f"| {_fmt(r['gru_mae'], 2)} | {_fmt(r['gru_rmse'], 2)} | {_fmt(r['gru_r2'])} |"
-        )
-
-    lines += [
-        "",
-        "---",
-        "",
-        "## 4. Evaluation by Month",
-        "",
-        "| Month | N | XGB MAE | XGB RMSE | XGB R² | GRU MAE | GRU RMSE | GRU R² |",
-        "|------:|--:|--------:|---------:|-------:|--------:|---------:|-------:|",
-    ]
-    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
-                   7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-    for _, r in month_df.iterrows():
-        mo = month_names.get(int(r["month"]), str(int(r["month"])))
-        lines.append(
-            f"| {mo} | {int(r['n'])} "
-            f"| {_fmt(r['xgb_mae'], 2)} | {_fmt(r['xgb_rmse'], 2)} | {_fmt(r['xgb_r2'])} "
-            f"| {_fmt(r['gru_mae'], 2)} | {_fmt(r['gru_rmse'], 2)} | {_fmt(r['gru_r2'])} |"
-        )
-
-    lines += [
-        "",
-        "---",
-        "",
-        "## 5. Features Used",
+        "## 3. Features Used",
         "",
         "| # | Feature |",
         "|--:|:--------|",
@@ -939,11 +1119,11 @@ def _write_markdown_report(
         "",
         "---",
         "",
-        "## 6. Preprocessing Notes",
+        "## 4. Preprocessing Notes",
         "",
         "- **Target:** `rain` (mm) → `log1p` transformed (reduces skewness)",
         "- **Scaling:** RobustScaler for GRU input features (resistant to outliers)",
-        "- **Split:** strict temporal — no data leakage across train/test",
+        "- **Split:** strict temporal — train/validation/test, no data leakage",
         "- **Cyclical encoding:** `sin/cos` for month, day-of-year, wind direction",
         "- **Lag features:** rain rolled mean/max/std at 7d, 14d, 30d per province",
         "- **Domain features:** `is_rainy_season`, `consecutive_dry_days`, `humid_cloud`, `pressure_diff`, `temp_humid_interaction`",
@@ -969,7 +1149,11 @@ def final_summary(
     # ── 1. Overall comparison table ───────────────────────────────────────
     print(f"\n{sep}")
     print(f"  RAINFALL PREDICTION — FINAL COMPARISON")
-    print(f"  Train: 2009–2020 | Test: {cfg.test_year} | Run: {ts}")
+    print(
+        f"  Train: 2009–{cfg.train_end_year} | "
+        f"Val: {cfg.val_start_year}–{cfg.val_end_year} | "
+        f"Test: {cfg.test_year} | Run: {ts}"
+    )
     print(f"  Target: rain (mm) via log1p | Features: {len(FEATURE_COLS)}")
     print(f"{sep}\n")
 
@@ -1005,71 +1189,22 @@ def final_summary(
     )
     print(f"\n  Best model: {best_model}  |  R² (log1p) = {best_r2:.4f}  |  Rating: {rating}")
 
-    # ── 2. Per-region breakdown ────────────────────────────────────────────
-    mapping      = pd.read_csv(cfg.mapping_path)
-    region_names = dict(zip(mapping["region_encoded"], mapping["region"]))
+    # Rebuild a compact evaluation table used for exported predictions.
+    df_eval = test_df[["date", TARGET_ORIG_COL]].copy().reset_index(drop=True)
+    df_eval["xgb_pred"] = np.asarray(xgb["predictions_mm"])
 
-    df_eval = test_df[["date", TARGET_ORIG_COL, "region_encoded", "province_encoded"]].copy()
-    df_eval = df_eval.reset_index(drop=True)
-    df_eval["xgb_pred"]  = xgb["predictions_mm"]
-    lstm_preds = lstm["predictions_mm"]
-    if len(lstm_preds) < len(df_eval):
-        padded = np.full(len(df_eval), np.nan)
-        padded[len(df_eval) - len(lstm_preds):] = lstm_preds
-        df_eval["lstm_pred"] = padded
+    lstm_pred = np.asarray(lstm["predictions_mm"])
+    if len(lstm_pred) == len(df_eval):
+        df_eval["lstm_pred"] = lstm_pred
     else:
-        df_eval["lstm_pred"] = lstm_preds[: len(df_eval)]
-    df_eval["month"] = pd.to_datetime(df_eval["date"]).dt.month
-
-    region_rows = []
-    print(f"\n{sep}")
-    print("  EVALUATION BY REGION (mm scale)")
-    print(f"{sep}")
-    print(f"  {'Region':<14} {'N':>6}  {'XGB MAE':>9} {'XGB R²':>8}  {'GRU MAE':>9} {'GRU R²':>8}")
-    print("  " + "─" * 60)
-    for code in sorted(df_eval["region_encoded"].unique()):
-        mask  = df_eval["region_encoded"] == code
-        y_t   = df_eval.loc[mask, TARGET_ORIG_COL].values
-        y_xgb = df_eval.loc[mask, "xgb_pred"].values
-        y_gru = df_eval.loc[mask, "lstm_pred"].values
-        m_xgb = _segment_metrics(y_t, y_xgb)
-        valid = ~np.isnan(y_gru)
-        m_gru = _segment_metrics(y_t[valid], y_gru[valid])
-        name  = region_names.get(int(code), f"Region {int(code)}")
-        print(f"  {name:<14} {m_xgb['n']:>6}  "
-              f"{m_xgb['mae']:>9.2f} {m_xgb['r2']:>8.4f}  "
-              f"{m_gru['mae']:>9.2f} {m_gru['r2']:>8.4f}")
-        region_rows.append({
-            "region": name, "n": m_xgb["n"],
-            "xgb_mae": m_xgb["mae"], "xgb_rmse": m_xgb["rmse"], "xgb_r2": m_xgb["r2"],
-            "gru_mae": m_gru["mae"], "gru_rmse": m_gru["rmse"], "gru_r2": m_gru["r2"],
-        })
-    region_df = pd.DataFrame(region_rows)
-
-    # ── 3. Per-month breakdown ─────────────────────────────────────────────
-    month_rows = []
-    print(f"\n{sep}")
-    print("  EVALUATION BY MONTH (mm scale)")
-    print(f"{sep}")
-    print(f"  {'Month':>6} {'N':>6}  {'XGB MAE':>9} {'XGB R²':>8}  {'GRU MAE':>9} {'GRU R²':>8}")
-    print("  " + "─" * 60)
-    for mo in sorted(df_eval["month"].unique()):
-        mask  = df_eval["month"] == mo
-        y_t   = df_eval.loc[mask, TARGET_ORIG_COL].values
-        y_xgb = df_eval.loc[mask, "xgb_pred"].values
-        y_gru_raw = df_eval.loc[mask, "lstm_pred"].values
-        m_xgb = _segment_metrics(y_t, y_xgb)
-        valid = ~np.isnan(y_gru_raw)
-        m_gru = _segment_metrics(y_t[valid], y_gru_raw[valid])
-        print(f"  {mo:>6} {m_xgb['n']:>6}  "
-              f"{m_xgb['mae']:>9.2f} {m_xgb['r2']:>8.4f}  "
-              f"{m_gru['mae']:>9.2f} {m_gru['r2']:>8.4f}")
-        month_rows.append({
-            "month": int(mo), "n": m_xgb["n"],
-            "xgb_mae": m_xgb["mae"], "xgb_rmse": m_xgb["rmse"], "xgb_r2": m_xgb["r2"],
-            "gru_mae": m_gru["mae"], "gru_rmse": m_gru["rmse"], "gru_r2": m_gru["r2"],
-        })
-    month_df = pd.DataFrame(month_rows)
+        aligned = np.full(len(df_eval), np.nan)
+        n = min(len(aligned), len(lstm_pred))
+        aligned[:n] = lstm_pred[:n]
+        df_eval["lstm_pred"] = aligned
+        log.warn(
+            "LSTM prediction length != test rows. "
+            f"rows={len(df_eval)}, preds={len(lstm_pred)}. Filled remaining rows with NaN."
+        )
 
     # ── 4. Save all result files ───────────────────────────────────────────
     # 4a. Predictions CSV
@@ -1080,19 +1215,15 @@ def final_summary(
     imp_path = cfg.output_dir / "feature_importance.csv"
     xgb["feature_importance"].to_csv(imp_path, index=False)
 
-    # 4c. Region breakdown CSV
-    region_path = cfg.output_dir / "eval_by_region.csv"
-    region_df.to_csv(region_path, index=False)
-
-    # 4d. Month breakdown CSV
-    month_path = cfg.output_dir / "eval_by_month.csv"
-    month_df.to_csv(month_path, index=False)
+    # (Removed region and month breakdowns for pipeline efficiency)
 
     # 4e. Metrics JSON (full report)
     metrics_report = {
         "run_timestamp": ts,
         "pipeline_time_s": round(pipeline_time, 1),
-        "train_period": "2009-2020",
+        "train_period": f"2009-{cfg.train_end_year}",
+        "validation_period": f"{cfg.val_start_year}-{cfg.val_end_year}",
+        "final_fit_period": f"2009-{cfg.val_end_year}",
         "test_period":  f"{cfg.test_year}",
         "n_features":   len(FEATURE_COLS),
         "features":     FEATURE_COLS,
@@ -1128,7 +1259,7 @@ def final_summary(
     md_path = cfg.output_dir / "evaluation_report.md"
     _write_markdown_report(
         md_path, metrics_report, xgb, lstm,
-        region_df, month_df, cfg, pipeline_time, ts,
+        cfg, pipeline_time, ts,
     )
 
     # ── 5. Print saved files ───────────────────────────────────────────────
@@ -1138,14 +1269,14 @@ def final_summary(
     saved = [
         (pred_path,    "Predictions (date, actual, xgb_pred, gru_pred)"),
         (imp_path,     "Feature importance (XGBoost)"),
-        (region_path,  "Evaluation by region"),
-        (month_path,   "Evaluation by month"),
         (metrics_path, "Full metrics report (JSON)"),
         (md_path,      "Evaluation report (Markdown)"),
         (cfg.output_dir / "lstm_loss_curve.csv", "GRU training loss curve"),
-        (cfg.output_dir / "weather_train_2009_2020.csv",    "Preprocessed train data (unscaled)"),
+        (cfg.output_dir / "weather_train_2009_2018.csv",    "Preprocessed train data (unscaled)"),
+        (cfg.output_dir / "weather_val_2019_2020.csv",      "Preprocessed validation data (unscaled)"),
         (cfg.output_dir / "weather_test_2021.csv",          "Preprocessed test data (unscaled)"),
-        (cfg.output_dir / "weather_train_2009_2020_scaled.csv", "Preprocessed train data (scaled)"),
+        (cfg.output_dir / "weather_train_2009_2018_scaled.csv", "Preprocessed train data (scaled)"),
+        (cfg.output_dir / "weather_val_2019_2020_scaled.csv",   "Preprocessed validation data (scaled)"),
         (cfg.output_dir / "weather_test_2021_scaled.csv",       "Preprocessed test data (scaled)"),
         (cfg.output_dir / "scalers.pkl",         "RobustScaler objects (joblib)"),
     ]
@@ -1173,23 +1304,53 @@ def main():
     # Step 2: Feature Engineering
     df = engineer_features(df, cfg)
 
-    # Step 3: Train/Test Split
-    train_df, test_df = split_train_test(df, cfg)
+    # Step 3: Train/Validation/Test Split
+    train_df, val_df, test_df = split_train_val_test(df, cfg)
 
     # Step 4: Select Features, Scale & Save
-    train_unscaled, test_unscaled, feat_scaler, tgt_scaler = select_scale_save(
-        train_df, test_df, cfg,
+    train_unscaled, val_unscaled, test_unscaled, feat_scaler, tgt_scaler = select_scale_save(
+        train_df, val_df, test_df, cfg,
     )
 
-    # Step 5: XGBoost (Tweedie loss — better for zero-inflated rainfall)
-    xgb_results = evaluate_xgboost(train_unscaled, test_unscaled, cfg)
+    # Final model fit uses train + validation; test set remains untouched for final evaluation.
+    model_train_unscaled = pd.concat([train_unscaled, val_unscaled], ignore_index=True)
+    model_train_unscaled = model_train_unscaled.sort_values(["province_encoded", "date"]).reset_index(drop=True)
 
-    # Step 6: LSTM (GRU variant)
-    lstm_results = evaluate_lstm(train_unscaled, test_unscaled, feat_scaler, tgt_scaler, cfg)
+    # Step 5: XGBoost
+    xgb_results = evaluate_xgboost(model_train_unscaled, test_unscaled, cfg)
 
-    # Step 7: Final Summary
+    # Step 6: Random Forest
+    rf_results = evaluate_random_forest(model_train_unscaled, test_unscaled, cfg)
+
+    # Step 7: Prophet
+    prophet_results = evaluate_prophet(model_train_unscaled, test_unscaled, cfg)
+
+    # Step 8: LSTM (GRU variant)
+    lstm_results = evaluate_lstm(model_train_unscaled, test_unscaled, feat_scaler, tgt_scaler, cfg)
+
+    # Step 9: Final Summary (kept backward-compatible: XGBoost vs GRU/LSTM)
     pipeline_time = time.time() - t_start
     summary = final_summary(xgb_results, lstm_results, test_unscaled, cfg, pipeline_time)
+
+    summary["random_forest"] = {
+        "r2_log1p": round(rf_results["r2_log"], 4),
+        "rmse_log1p": round(rf_results["rmse_log"], 4),
+        "mae_log1p": round(rf_results["mae_log"], 4),
+        "r2_mm": round(rf_results["r2_mm"], 4),
+        "rmse_mm": round(rf_results["rmse_mm"], 4),
+        "mae_mm": round(rf_results["mae_mm"], 4),
+        "cv_rmse": rf_results["cv_rmse"],
+        "train_time_s": round(rf_results["train_time"], 1),
+    }
+    summary["prophet"] = {
+        "r2_log1p": round(prophet_results["r2_log"], 4),
+        "rmse_log1p": round(prophet_results["rmse_log"], 4),
+        "mae_log1p": round(prophet_results["mae_log"], 4),
+        "r2_mm": round(prophet_results["r2_mm"], 4),
+        "rmse_mm": round(prophet_results["rmse_mm"], 4),
+        "mae_mm": round(prophet_results["mae_mm"], 4),
+        "train_time_s": round(prophet_results["train_time"], 1),
+    }
 
     return summary
 
